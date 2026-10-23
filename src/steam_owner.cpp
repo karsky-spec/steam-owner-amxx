@@ -1,0 +1,206 @@
+// Steam Owner - AMX Mod X module
+//
+// (Re)HLDS authenticates players with SteamGameServer()->SendUserConnectAndAuthenticate(), and Steam
+// answers with the GSClientApprove_t callback. Current Steamworks SDK defines it as
+//     struct GSClientApprove_t { CSteamID m_SteamID; CSteamID m_OwnerSteamID; };
+// where m_OwnerSteamID is the owner of the game license (differs from m_SteamID with Family Sharing).
+// The engine was built against an older SDK that only knows m_SteamID, so the owner is ignored.
+//
+// This module registers its own listener for the same callback (Steam allows several listeners per
+// callback), reads m_OwnerSteamID and passes it to plugins through the client_steam_owner() forward.
+
+#include "amxxmodule.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef unsigned char uint8_t_;
+typedef unsigned long long uint64_t_;
+
+// Must match the binary layout of CCallbackBase in the steam_api library used by (Re)HLDS
+// (rehlds/public/steam/steam_api.h): vtable with Run(void*), Run(void*, bool, SteamAPICall_t),
+// GetCallbackSizeBytes(), then uint8 flags and int callback id
+class CCallbackBase
+{
+public:
+	CCallbackBase() { m_nCallbackFlags = 0; m_iCallback = 0; }
+	virtual void Run(void *pvParam) = 0;
+	virtual void Run(void *pvParam, bool bIOFailure, uint64_t_ hSteamAPICall) = 0;
+	virtual int GetCallbackSizeBytes() = 0;
+
+protected:
+	enum { k_ECallbackFlagsRegistered = 0x01, k_ECallbackFlagsGameServer = 0x02 };
+	uint8_t_ m_nCallbackFlags;
+	int m_iCallback;
+};
+
+extern "C" void SteamAPI_RegisterCallback(CCallbackBase *pCallback, int iCallback);
+extern "C" void SteamAPI_UnregisterCallback(CCallbackBase *pCallback);
+
+// k_iSteamGameServerCallbacks (200) + 1
+#define GSCLIENTAPPROVE_CALLBACK	201
+
+struct GSClientApprove_t
+{
+	uint64_t_ m_SteamID;
+	uint64_t_ m_OwnerSteamID;
+};
+
+// Last approvals, so plugins can also ask for the owner later through a native
+#define OWNER_CACHE_SIZE	64
+
+struct OwnerEntry
+{
+	uint64_t_ player;
+	uint64_t_ owner;
+};
+
+static OwnerEntry g_Cache[OWNER_CACHE_SIZE];
+static int g_iCacheNext = 0;
+
+static int g_fwdOwner = -1;
+static bool g_bRegistered = false;
+
+// Public universe, individual account, desktop instance: the upper 32 bits of a normal player's SteamID64
+static bool IsIndividualSteamId(uint64_t_ id)
+{
+	return (id >> 32) == 0x01100001ULL && (id & 0xFFFFFFFFULL) != 0;
+}
+
+static void SteamIdToAuthId(uint64_t_ id, char *out, size_t len)
+{
+	unsigned int account = (unsigned int)(id & 0xFFFFFFFFULL);
+	snprintf(out, len, "STEAM_0:%u:%u", account & 1, account >> 1);
+}
+
+// "STEAM_0:X:Y" -> SteamID64, 0 on failure. Only STEAM_0: real Steam players in GoldSrc always have it,
+// while with Reunion STEAM_1:X:Y is a generated non-steam id that belongs to someone else.
+// Parsed by hand: sscanf from a new glibc would make the module require GLIBC_2.38 on the server
+static uint64_t_ AuthIdToSteamId(const char *auth)
+{
+	if (strncmp(auth, "STEAM_0:", 8) != 0
+		|| (auth[8] != '0' && auth[8] != '1') || auth[9] != ':' || auth[10] < '0' || auth[10] > '9')
+		return 0;
+
+	uint64_t_ y = 0;
+
+	for (const char *p = auth + 10; *p; p++)
+	{
+		if (*p < '0' || *p > '9' || y > 0x7FFFFFFFULL)
+			return 0;
+
+		y = y * 10 + (*p - '0');
+	}
+
+	return 0x0110000100000000ULL + y * 2 + (auth[8] - '0');
+}
+
+static void OnClientApprove(const GSClientApprove_t *pApprove)
+{
+	if (!pApprove || !IsIndividualSteamId(pApprove->m_SteamID))
+		return;
+
+	char szAuth[32], szOwnerAuth[32] = "", szOwner64[24] = "";
+	SteamIdToAuthId(pApprove->m_SteamID, szAuth, sizeof(szAuth));
+
+	// Garbage or 0 here would mean Steam sent the old, shorter callback without the owner field
+	uint64_t_ owner = pApprove->m_OwnerSteamID;
+	bool bOwnerKnown = IsIndividualSteamId(owner);
+
+	if (bOwnerKnown)
+	{
+		SteamIdToAuthId(owner, szOwnerAuth, sizeof(szOwnerAuth));
+		snprintf(szOwner64, sizeof(szOwner64), "%llu", owner);
+
+		g_Cache[g_iCacheNext].player = pApprove->m_SteamID;
+		g_Cache[g_iCacheNext].owner = owner;
+		g_iCacheNext = (g_iCacheNext + 1) % OWNER_CACHE_SIZE;
+	}
+
+#ifdef STEAMOWNER_DEBUG
+	MF_Log("Approved %s (%llu), owner field raw %llu -> %s", szAuth, pApprove->m_SteamID, owner,
+		bOwnerKnown ? szOwnerAuth : "unknown");
+#endif
+
+	if (g_fwdOwner != -1)
+	{
+		MF_ExecuteForward(g_fwdOwner, szAuth, szOwnerAuth, szOwner64);
+	}
+}
+
+class CClientApproveCallback : public CCallbackBase
+{
+public:
+	CClientApproveCallback()
+	{
+		// Same as STEAM_GAMESERVER_CALLBACK: listen on the game server pipe, not the client one
+		m_nCallbackFlags |= k_ECallbackFlagsGameServer;
+		m_iCallback = GSCLIENTAPPROVE_CALLBACK;
+	}
+
+	virtual void Run(void *pvParam) { OnClientApprove((const GSClientApprove_t *)pvParam); }
+	virtual void Run(void *pvParam, bool, uint64_t_) { OnClientApprove((const GSClientApprove_t *)pvParam); }
+	virtual int GetCallbackSizeBytes() { return sizeof(GSClientApprove_t); }
+};
+
+static CClientApproveCallback g_ApproveCallback;
+
+// native steam_get_owner(const authid[], owner_authid[], len);
+// Returns 1 and the owner's STEAM_0:X:Y if the player was approved recently, 0 if unknown
+static cell AMX_NATIVE_CALL steam_get_owner(AMX *amx, cell *params)
+{
+	int len;
+	const char *auth = MF_GetAmxString(amx, params[1], 0, &len);
+	uint64_t_ player = AuthIdToSteamId(auth);
+
+	if (!player)
+		return 0;
+
+	for (int i = 0; i < OWNER_CACHE_SIZE; i++)
+	{
+		if (g_Cache[i].player == player)
+		{
+			char szOwnerAuth[32];
+			SteamIdToAuthId(g_Cache[i].owner, szOwnerAuth, sizeof(szOwnerAuth));
+			MF_SetAmxString(amx, params[2], szOwnerAuth, params[3]);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static AMX_NATIVE_INFO g_Natives[] =
+{
+	{ "steam_get_owner", steam_get_owner },
+	{ NULL, NULL }
+};
+
+void OnAmxxAttach()
+{
+	MF_AddNatives(g_Natives);
+
+	SteamAPI_RegisterCallback(&g_ApproveCallback, GSCLIENTAPPROVE_CALLBACK);
+	g_bRegistered = true;
+}
+
+void OnAmxxDetach()
+{
+	if (g_bRegistered)
+	{
+		SteamAPI_UnregisterCallback(&g_ApproveCallback);
+		g_bRegistered = false;
+	}
+}
+
+void OnPluginsLoaded()
+{
+	// forward client_steam_owner(const authid[], const owner_authid[], const owner_steamid64[]);
+	g_fwdOwner = MF_RegisterForward("client_steam_owner", ET_IGNORE, FP_STRING, FP_STRING, FP_STRING, FP_DONE);
+}
+
+void OnPluginsUnloaded()
+{
+	// Forward ids are invalid until plugins are loaded again on the next map
+	g_fwdOwner = -1;
+}

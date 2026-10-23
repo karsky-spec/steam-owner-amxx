@@ -47,7 +47,8 @@ struct GSClientApprove_t
 };
 
 // Last approvals, so plugins can also ask for the owner later through a native
-#define OWNER_CACHE_SIZE	64
+// Big enough that a player who stays connected isn't pushed out by others joining (16 bytes per entry)
+#define OWNER_CACHE_SIZE	256
 
 struct OwnerEntry
 {
@@ -92,6 +93,10 @@ static uint64_t_ AuthIdToSteamId(const char *auth)
 		y = y * 10 + (*p - '0');
 	}
 
+	// The last digit can still push Y past 31 bits
+	if (y > 0x7FFFFFFFULL)
+		return 0;
+
 	return 0x0110000100000000ULL + y * 2 + (auth[8] - '0');
 }
 
@@ -107,14 +112,37 @@ static void OnClientApprove(const GSClientApprove_t *pApprove)
 	uint64_t_ owner = pApprove->m_OwnerSteamID;
 	bool bOwnerKnown = IsIndividualSteamId(owner);
 
+	// Reuse the player's slot on reconnect, so one player never holds more than one entry
+	int slot = -1;
+
+	for (int i = 0; i < OWNER_CACHE_SIZE; i++)
+	{
+		if (g_Cache[i].player == pApprove->m_SteamID)
+		{
+			slot = i;
+			break;
+		}
+	}
+
 	if (bOwnerKnown)
 	{
 		SteamIdToAuthId(owner, szOwnerAuth, sizeof(szOwnerAuth));
 		snprintf(szOwner64, sizeof(szOwner64), "%llu", owner);
 
-		g_Cache[g_iCacheNext].player = pApprove->m_SteamID;
-		g_Cache[g_iCacheNext].owner = owner;
-		g_iCacheNext = (g_iCacheNext + 1) % OWNER_CACHE_SIZE;
+		if (slot == -1)
+		{
+			slot = g_iCacheNext;
+			g_iCacheNext = (g_iCacheNext + 1) % OWNER_CACHE_SIZE;
+		}
+
+		g_Cache[slot].player = pApprove->m_SteamID;
+		g_Cache[slot].owner = owner;
+	}
+	else if (slot != -1)
+	{
+		// Owner unknown this time: drop the old entry instead of answering with a stale owner
+		g_Cache[slot].player = 0;
+		g_Cache[slot].owner = 0;
 	}
 
 #ifdef STEAMOWNER_DEBUG

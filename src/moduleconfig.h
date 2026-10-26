@@ -2,7 +2,7 @@
 #define __MODULECONFIG_H__
 
 #define MODULE_NAME "Steam Owner"
-#define MODULE_VERSION "1.0.1"
+#define MODULE_VERSION "1.1.0"
 #define MODULE_AUTHOR "Soul"
 #define MODULE_URL ""
 #define MODULE_LOGTAG "STEAMOWNER"

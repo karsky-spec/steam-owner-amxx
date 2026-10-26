@@ -28,12 +28,12 @@ being public.
 #include <steam_owner>
 
 /**
- * Called when Steam approves a connecting player.
+ * Called when Steam approves a connecting player, with the player's index (1-32).
  *   owner_authid == authid  -> own copy
  *   owner_authid != authid  -> Family Sharing, owner_authid is the license owner
  *   owner_authid == ""       -> Steam did not report the owner
  */
-forward client_steam_owner(const authid[], const owner_authid[], const owner_steamid64[]);
+forward client_steam_owner(id, const authid[], const owner_authid[], const owner_steamid64[]);
 
 /**
  * Look up the owner of a recently approved player.
@@ -51,14 +51,15 @@ native steam_get_owner(const authid[], owner_authid[], len);
 public plugin_init()
     register_plugin("Owner Example", "1.0", "you");
 
-public client_steam_owner(const szAuthId[], const szOwnerAuthId[], const szOwner64[])
+public client_steam_owner(id, const szAuthId[], const szOwnerAuthId[], const szOwner64[])
 {
     // own copy or no data: nothing to do
     if(!szOwnerAuthId[0] || equal(szOwnerAuthId, szAuthId))
         return;
 
-    // the player runs a copy shared by szOwnerAuthId -> plug your own logic here
-    log_amx("%s plays a copy shared by %s (%s)", szAuthId, szOwnerAuthId, szOwner64);
+    // the player runs a copy shared by szOwnerAuthId -> plug your own logic here,
+    // id is the player's index: kick, ban or message them directly
+    log_amx("%n (%s) plays a copy shared by %s (%s)", id, szAuthId, szOwnerAuthId, szOwner64);
 }
 ```
 
@@ -100,8 +101,15 @@ Needs a 32-bit C++ toolchain: `sudo apt install g++-multilib`.
 - **The owner is always a real Steam account** (`STEAM_0:`). Reunion's generated `STEAM_1:` ids are
   not Steam accounts.
 - **Linux only.** A Windows server needs a `.dll` build.
-- The forward fires a moment **after** `client_authorized`, once Steam's reply arrives — not in
-  `client_connect`.
+- The forward fires once the player is **both** approved by Steam and authorized by AMXX
+  (`client_authorized`), whichever comes last — so `id` is always the right player. The player may
+  still be connecting (`is_user_connecting`), not yet in game; kicking works either way.
+
+## Upgrading from 1.0.x
+
+1.1.0 adds the player's index as the **first** parameter of `client_steam_owner`. Update the
+function header in your plugins and **recompile them with the new `steam_owner.inc`**: a plugin
+compiled for 1.0.x keeps loading, but would read the index where it expects the authid.
 - Relies on Steam populating `m_OwnerSteamID` in the approval callback — confirmed working on ReHLDS
   with current Steam.
 

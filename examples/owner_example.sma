@@ -15,24 +15,25 @@ public plugin_init()
 	register_plugin("Steam Owner Example", "1.0.0", "Soul");
 }
 
-public client_steam_owner(const szAuthId[], const szOwnerAuthId[], const szOwnerSteamId64[])
+public client_steam_owner(id, const szAuthId[], const szOwnerAuthId[], const szOwnerSteamId64[])
 {
 	// Steam did not report an owner - nothing to do
 	if(!szOwnerAuthId[0])
 	{
-		log_amx("%s: owner unknown", szAuthId);
+		log_amx("%n (%s): owner unknown", id, szAuthId);
 		return;
 	}
 
 	// Own copy: the license owner is the player themselves
 	if(equal(szOwnerAuthId, szAuthId))
 	{
-		log_amx("%s plays their own copy", szAuthId);
+		log_amx("%n (%s) plays their own copy", id, szAuthId);
 		return;
 	}
 
 	// Family Sharing: the game belongs to another account
-	log_amx("%s plays a copy shared by %s (%s)", szAuthId, szOwnerAuthId, szOwnerSteamId64);
+	log_amx("%n (%s) plays a copy shared by %s (%s)", id, szAuthId, szOwnerAuthId, szOwnerSteamId64);
 
-	// --- your logic here, e.g. check whether szOwnerAuthId is banned and act on it ---
+	// --- your logic here, e.g. if szOwnerAuthId is banned:
+	// server_cmd("kick #%d ^"Konto wlasciciela gry jest zbanowane^"", get_user_userid(id))
 }

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef unsigned char uint8_t_;
 typedef unsigned long long uint64_t_;
@@ -100,13 +101,126 @@ static uint64_t_ AuthIdToSteamId(const char *auth)
 	return 0x0110000100000000ULL + y * 2 + (auth[8] - '0');
 }
 
+// The forward carries the player's slot (1-32), so plugins can act on them right away. Steam's approval
+// and AMXX's authorization of the same player come in either order: whichever comes second fires it.
+#define MAX_CLIENTS			32
+#define PENDING_SIZE		64
+#define PENDING_TIMEOUT		120	// seconds an approval waits for its player to be authorized
+
+// SteamID64 of the player AMXX authorized in each slot (0: none, bot, LAN or non-Steam)
+static uint64_t_ g_PlayerSteamId[MAX_CLIENTS + 1];
+
+// Approvals whose player isn't authorized in a slot yet
+struct PendingApproval
+{
+	uint64_t_ player;
+	uint64_t_ owner;
+	time_t at;
+};
+
+static PendingApproval g_Pending[PENDING_SIZE];
+
+// forward client_steam_owner(id, const authid[], const owner_authid[], const owner_steamid64[]);
+static void FireOwnerForward(int id, uint64_t_ player, uint64_t_ owner)
+{
+	if (g_fwdOwner == -1)
+		return;
+
+	char szAuth[32], szOwnerAuth[32] = "", szOwner64[24] = "";
+	SteamIdToAuthId(player, szAuth, sizeof(szAuth));
+
+	// Garbage or 0 would mean Steam sent the old, shorter callback without the owner field
+	if (IsIndividualSteamId(owner))
+	{
+		SteamIdToAuthId(owner, szOwnerAuth, sizeof(szOwnerAuth));
+		snprintf(szOwner64, sizeof(szOwner64), "%llu", owner);
+	}
+
+	MF_ExecuteForward(g_fwdOwner, (cell)id, szAuth, szOwnerAuth, szOwner64);
+}
+
+// Slot of a connecting or connected player with this SteamID, 0 if none
+static int FindPlayer(uint64_t_ steamId)
+{
+	for (int id = 1; id <= MAX_CLIENTS; id++)
+	{
+		if (g_PlayerSteamId[id] == steamId && (MF_IsPlayerIngame(id) || MF_IsPlayerConnecting(id)))
+			return id;
+	}
+
+	return 0;
+}
+
+static void AddPending(uint64_t_ player, uint64_t_ owner)
+{
+	time_t now = time(NULL);
+	int slot = -1;
+
+	// The player's own entry, else a free or expired one, else the oldest
+	for (int i = 0; i < PENDING_SIZE; i++)
+	{
+		if (g_Pending[i].player == player)
+		{
+			slot = i;
+			break;
+		}
+
+		if (slot == -1 && (!g_Pending[i].player || now - g_Pending[i].at > PENDING_TIMEOUT))
+			slot = i;
+	}
+
+	if (slot == -1)
+	{
+		slot = 0;
+
+		for (int i = 1; i < PENDING_SIZE; i++)
+		{
+			if (g_Pending[i].at < g_Pending[slot].at)
+				slot = i;
+		}
+	}
+
+	g_Pending[slot].player = player;
+	g_Pending[slot].owner = owner;
+	g_Pending[slot].at = now;
+}
+
+// AMXX authorized a player (client_authorized): remember their SteamID and fire a waiting approval
+static void OnClientAuthorized(int id, const char *authstring)
+{
+	if (id < 1 || id > MAX_CLIENTS)
+		return;
+
+	uint64_t_ steamId = authstring ? AuthIdToSteamId(authstring) : 0;
+	g_PlayerSteamId[id] = steamId;
+
+	if (!steamId)
+		return;
+
+	time_t now = time(NULL);
+
+	for (int i = 0; i < PENDING_SIZE; i++)
+	{
+		if (g_Pending[i].player != steamId)
+			continue;
+
+		g_Pending[i].player = 0;
+
+		if (now - g_Pending[i].at <= PENDING_TIMEOUT)
+		{
+#ifdef STEAMOWNER_DEBUG
+			MF_Log("Authorized %s in slot %d, firing its approval", authstring, id);
+#endif
+			FireOwnerForward(id, steamId, g_Pending[i].owner);
+		}
+		break;
+	}
+}
+
 static void OnClientApprove(const GSClientApprove_t *pApprove)
 {
 	if (!pApprove || !IsIndividualSteamId(pApprove->m_SteamID))
 		return;
-
-	char szAuth[32], szOwnerAuth[32] = "", szOwner64[24] = "";
-	SteamIdToAuthId(pApprove->m_SteamID, szAuth, sizeof(szAuth));
 
 	// Garbage or 0 here would mean Steam sent the old, shorter callback without the owner field
 	uint64_t_ owner = pApprove->m_OwnerSteamID;
@@ -126,9 +240,6 @@ static void OnClientApprove(const GSClientApprove_t *pApprove)
 
 	if (bOwnerKnown)
 	{
-		SteamIdToAuthId(owner, szOwnerAuth, sizeof(szOwnerAuth));
-		snprintf(szOwner64, sizeof(szOwner64), "%llu", owner);
-
 		if (slot == -1)
 		{
 			slot = g_iCacheNext;
@@ -145,15 +256,22 @@ static void OnClientApprove(const GSClientApprove_t *pApprove)
 		g_Cache[slot].owner = 0;
 	}
 
+	// Already authorized: fire now with their slot, otherwise when AMXX authorizes them
+	int id = FindPlayer(pApprove->m_SteamID);
+
 #ifdef STEAMOWNER_DEBUG
-	MF_Log("Approved %s (%llu), owner field raw %llu -> %s", szAuth, pApprove->m_SteamID, owner,
-		bOwnerKnown ? szOwnerAuth : "unknown");
+	char szAuth[32], szOwnerAuth[32] = "unknown";
+	SteamIdToAuthId(pApprove->m_SteamID, szAuth, sizeof(szAuth));
+	if (bOwnerKnown)
+		SteamIdToAuthId(owner, szOwnerAuth, sizeof(szOwnerAuth));
+	MF_Log("Approved %s (%llu), owner field raw %llu -> %s, %s", szAuth, pApprove->m_SteamID, owner, szOwnerAuth,
+		id ? "player already authorized, firing" : "waiting for authorization");
 #endif
 
-	if (g_fwdOwner != -1)
-	{
-		MF_ExecuteForward(g_fwdOwner, szAuth, szOwnerAuth, szOwner64);
-	}
+	if (id)
+		FireOwnerForward(id, pApprove->m_SteamID, owner);
+	else
+		AddPending(pApprove->m_SteamID, owner);
 }
 
 class CClientApproveCallback : public CCallbackBase
@@ -210,10 +328,14 @@ void OnAmxxAttach()
 
 	SteamAPI_RegisterCallback(&g_ApproveCallback, GSCLIENTAPPROVE_CALLBACK);
 	g_bRegistered = true;
+
+	MF_RegAuthFunc(OnClientAuthorized);
 }
 
 void OnAmxxDetach()
 {
+	MF_UnregAuthFunc(OnClientAuthorized);
+
 	if (g_bRegistered)
 	{
 		SteamAPI_UnregisterCallback(&g_ApproveCallback);
@@ -223,8 +345,8 @@ void OnAmxxDetach()
 
 void OnPluginsLoaded()
 {
-	// forward client_steam_owner(const authid[], const owner_authid[], const owner_steamid64[]);
-	g_fwdOwner = MF_RegisterForward("client_steam_owner", ET_IGNORE, FP_STRING, FP_STRING, FP_STRING, FP_DONE);
+	// forward client_steam_owner(id, const authid[], const owner_authid[], const owner_steamid64[]);
+	g_fwdOwner = MF_RegisterForward("client_steam_owner", ET_IGNORE, FP_CELL, FP_STRING, FP_STRING, FP_STRING, FP_DONE);
 }
 
 void OnPluginsUnloaded()
